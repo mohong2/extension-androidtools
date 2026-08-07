@@ -1,0 +1,6 @@
+# JVM 崩溃转储 / 调试日志（本地误产生的垃圾，不入库）
+hs_err_pid*.log
+replay_pid*.log
+
+# 个人编辑器配置
+.vscode/
