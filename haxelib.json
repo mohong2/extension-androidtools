@@ -15,8 +15,5 @@
 		"MAJigsaw77",
 		"Mohong"
 	],
-	"dependencies": {
-		"hxcpp":"",
-		"lime":""
-	}
+	"dependencies": {}
 }
