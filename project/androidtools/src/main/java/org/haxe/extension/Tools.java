@@ -17,6 +17,7 @@ import android.os.BatteryManager;
 import android.os.Build;
 import android.content.ContentResolver;
 import java.io.BufferedReader;
+import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.ByteArrayOutputStream;
@@ -996,6 +997,14 @@ public class Tools extends Extension
 	// -------------------------------------------------------------------------
 
 	public static final String EXTRACT_TMP_SUFFIX = ".tmp_extract";
+	/** Hidden marker in the storage root that records which app version last
+	 *  completed an extraction pass. Used to force overwrites after an update. */
+	public static final String EXTRACT_VERSION_FILE = ".extract_version";
+
+	/** Bundled files at or below this size are re-extracted after an app update
+	 *  even when their size is unchanged (settings/chart JSON, language and
+	 *  config files all live well below this threshold). */
+	private static final long FORCE_OVERWRITE_MAX_SIZE = 1024L * 1024L;
 
 	private static ZipFile apkZip;
 
@@ -1013,6 +1022,7 @@ public class Tools extends Extension
 
 		final String[] roots = parseAssetRoots(rootsCsv);
 		final File destDir = new File(destRoot);
+		final boolean forceReextract = !versionMarkerMatches(destDir);
 		final int[] missing = new int[] { 0 };
 
 		try
@@ -1024,10 +1034,16 @@ public class Tools extends Extension
 				{
 					if (!matchesAssetRoots(destRel, roots))
 						return;
-					if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel)))
+					if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel), forceReextract))
 						missing[0]++;
 				}
 			});
+
+			// Nothing to copy: record the current version so the next boot does
+			// not rescan with the update-forced overwrite path again. Only do
+			// this when the walk completed cleanly.
+			if (forceReextract && missing[0] == 0)
+				writeVersionMarker(destDir);
 		}
 		catch (Exception e)
 		{
@@ -1060,6 +1076,7 @@ public class Tools extends Extension
 			{
 				Thread.currentThread().setName("asset-extractor");
 
+				final boolean forceReextract = !versionMarkerMatches(destDir);
 				final List<String> failures = new ArrayList<String>();
 				int extracted = 0;
 				final int[] skippedCount = new int[] { 0 };
@@ -1075,7 +1092,7 @@ public class Tools extends Extension
 						{
 							if (!matchesAssetRoots(destRel, roots))
 								return;
-							if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel)))
+							if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel), forceReextract))
 								missing.add(destRel);
 							else
 								skippedCount[0]++;
@@ -1105,6 +1122,11 @@ public class Tools extends Extension
 				{
 					failures.add("__overall__\t" + String.valueOf(t));
 				}
+
+				// Only record the version after a clean pass, so interrupted or
+				// partially failed extractions are retried on the next launch.
+				if (failures.isEmpty())
+					writeVersionMarker(destDir);
 
 				postExtractComplete(listener, buildResultJson(total, extracted, skippedCount[0], failures));
 			}
@@ -1282,10 +1304,12 @@ public class Tools extends Extension
 	 * Decide whether an asset must be (re)extracted:
 	 * - missing on disk -> yes
 	 * - under mods/ -> never overwrite existing user content
-	 * - under assets/ -> re-extract when size differs from the APK entry, so
-	 *   updated builds replace stale files while identical files are skipped.
+	 * - under assets/ -> re-extract when the size differs from the APK entry
+	 * - after an app update (version marker mismatch), also re-extract small
+	 *   bundled files even when the size is unchanged, so updated JSON/config
+	 *   files actually overwrite the stale copies from the previous version.
 	 */
-	private static boolean needsExtraction(String destRel, String apkAssetPath, File dest)
+	private static boolean needsExtraction(String destRel, String apkAssetPath, File dest, boolean forceReextract)
 	{
 		if (!dest.exists())
 			return true;
@@ -1293,9 +1317,112 @@ public class Tools extends Extension
 			return false;
 
 		long expected = apkEntrySize(apkAssetPath);
-		if (expected < 0)
-			return false; // cannot verify -> keep the existing file
-		return dest.length() != expected;
+		if (expected >= 0 && dest.length() != expected)
+			return true;
+
+		// Small files are cheap to rewrite and include every settings/chart
+		// JSON, language and config file - overwrite them after an update so a
+		// same-size content change still lands on disk. (When the APK entry
+		// size cannot be read, e.g. split-APK installs, fall back to the size
+		// already on disk.)
+		long size = (expected >= 0) ? expected : dest.length();
+		if (forceReextract && size <= FORCE_OVERWRITE_MAX_SIZE)
+			return true;
+
+		return false;
+	}
+
+	/** "versionCode|versionName" of the installed APK, or null when unreadable. */
+	private static String currentApkVersion()
+	{
+		try
+		{
+			PackageManager pm = mainContext.getPackageManager();
+			PackageInfo pi = pm.getPackageInfo(mainContext.getPackageName(), 0);
+			long versionCode = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+				? pi.getLongVersionCode()
+				: (long) pi.versionCode;
+			String versionName = pi.versionName;
+			return String.valueOf(versionCode) + "|" + (versionName == null ? "" : versionName);
+		}
+		catch (Exception e)
+		{
+			return null;
+		}
+	}
+
+	/** True when the stored marker matches the installed APK version. */
+	private static boolean versionMarkerMatches(File destRoot)
+	{
+		String current = currentApkVersion();
+		if (current == null)
+			return true; // cannot read the app version -> keep the old behaviour
+
+		File marker = new File(destRoot, EXTRACT_VERSION_FILE);
+		String stored = null;
+		InputStream in = null;
+		try
+		{
+			byte[] data = new byte[Math.min((int) marker.length(), 4096)];
+			if (data.length > 0)
+			{
+				in = new FileInputStream(marker);
+				int n = in.read(data);
+				stored = new String(data, 0, Math.max(n, 0), "UTF-8").trim();
+			}
+		}
+		catch (Exception e)
+		{
+			stored = null;
+		}
+		finally
+		{
+			try { if (in != null) in.close(); } catch (Exception ignored) {}
+		}
+		return current.equals(stored);
+	}
+
+	/** Record the installed APK version so the next boot skips the forced pass. */
+	private static void writeVersionMarker(File destRoot)
+	{
+		String current = currentApkVersion();
+		if (current == null)
+			return;
+
+		try
+		{
+			if (!destRoot.exists() && !destRoot.mkdirs())
+				return;
+
+			File marker = new File(destRoot, EXTRACT_VERSION_FILE);
+			File tmp = new File(destRoot, EXTRACT_VERSION_FILE + ".tmp");
+			if (tmp.exists())
+				try { tmp.delete(); } catch (Exception ignored) {}
+
+			FileOutputStream out = new FileOutputStream(tmp);
+			try
+			{
+				out.write(current.getBytes("UTF-8"));
+				out.flush();
+			}
+			finally
+			{
+				try { out.close(); } catch (Exception ignored) {}
+			}
+
+			if (!tmp.renameTo(marker))
+			{
+				// Some filesystems refuse rename over an existing target.
+				if (marker.exists())
+					marker.delete();
+				if (!tmp.renameTo(marker))
+					Log.e(LOG_TAG, "writeVersionMarker: cannot finalize " + marker.getAbsolutePath());
+			}
+		}
+		catch (Exception e)
+		{
+			Log.e(LOG_TAG, "writeVersionMarker: " + e.toString());
+		}
 	}
 
 	private static ZipFile getApkZip()
