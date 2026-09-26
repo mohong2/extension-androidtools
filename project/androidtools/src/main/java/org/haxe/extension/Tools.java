@@ -1027,17 +1027,18 @@ public class Tools extends Extension
 
 		try
 		{
-			walkApkAssets(new AssetFileConsumer()
-			{
-				@Override
-				public void accept(String destRel, String apkAssetPath)
+				walkApkAssets(new AssetFileConsumer()
 				{
-					if (!matchesAssetRoots(destRel, roots))
-						return;
-					if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel), forceReextract))
-						missing[0]++;
-				}
-			});
+					@Override
+					public void accept(String destRel, String apkAssetPath)
+					{
+						destRel = collapseDoubledRoot(destRel, roots);
+						if (!matchesAssetRoots(destRel, roots))
+							return;
+						if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel), forceReextract))
+							missing[0]++;
+					}
+				});
 
 			// Nothing to copy: record the current version so the next boot does
 			// not rescan with the update-forced overwrite path again. Only do
@@ -1071,12 +1072,24 @@ public class Tools extends Extension
 
 		new Thread(new Runnable()
 		{
-			@Override
-			public void run()
-			{
-				Thread.currentThread().setName("asset-extractor");
+				@Override
+				public void run()
+				{
+					Thread.currentThread().setName("asset-extractor");
 
-				final boolean forceReextract = !versionMarkerMatches(destDir);
+					// Older builds could leave a nested layout (assets/assets, assets/mods)
+					// behind; salvage it BEFORE the walk so moved-up files count as existing
+					// and are not extracted a second time.
+					try
+					{
+						repairNestedLegacyLayout(destDir, roots);
+					}
+					catch (Throwable t)
+					{
+						Log.e(LOG_TAG, "repairNestedLegacyLayout: " + t.toString());
+					}
+
+					final boolean forceReextract = !versionMarkerMatches(destDir);
 				final List<String> failures = new ArrayList<String>();
 				int extracted = 0;
 				final int[] skippedCount = new int[] { 0 };
@@ -1090,6 +1103,7 @@ public class Tools extends Extension
 						@Override
 						public void accept(String destRel, String apkAssetPath)
 						{
+							destRel = collapseDoubledRoot(destRel, roots);
 							if (!matchesAssetRoots(destRel, roots))
 								return;
 							if (needsExtraction(destRel, apkAssetPath, new File(destDir, destRel), forceReextract))
@@ -1266,6 +1280,146 @@ public class Tools extends Extension
 				return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Guard against any packaging/ROM quirk that ever yields a doubled top-level
+	 * root in the asset path (e.g. "assets/assets/images/x.png"): collapse one
+	 * level so the engine folders can never end up nested inside themselves.
+	 * No bundled path in this project legitimately repeats a root name, and the
+	 * result is where the game expects to read the file from, so this is a no-op
+	 * on healthy builds.
+	 */
+	private static String collapseDoubledRoot(String destRel, String[] roots)
+	{
+		if (destRel == null)
+			return destRel;
+		for (String root : roots)
+		{
+			if (destRel.startsWith(root + "/" + root + "/"))
+				return destRel.substring(root.length() + 1);
+		}
+		return destRel;
+	}
+
+	/**
+	 * Older builds could extract with the top-level root applied twice, leaving a
+	 * nested "shell" layout like {@code <destRoot>/assets/assets/...} and
+	 * {@code <destRoot>/assets/mods/...}. Salvage everything one level up to where
+	 * the game reads it - never overwriting existing files, mirroring the
+	 * never-clobber policy of the normal extraction - then delete the leftover
+	 * duplicate tree. The missing-assets walk right after this re-extracts any
+	 * bundled file whose size differs from the APK, so the final state always
+	 * matches the bundled content.
+	 */
+	private static void repairNestedLegacyLayout(File destDir, String[] roots)
+	{
+		File assetsDir = new File(destDir, "assets");
+		if (!assetsDir.isDirectory())
+			return;
+
+		for (String root : roots)
+		{
+			// Bundled extraction only ever writes engine-owned content under
+			// assets/, so a root-named folder inside it is legacy junk.
+			File nested = new File(assetsDir, root);
+			if (!nested.isDirectory())
+				continue;
+
+			File targetParent = new File(destDir, root); // "assets" -> assetsDir itself
+			try
+			{
+				moveTreeUp(nested, targetParent);
+			}
+			catch (Exception e)
+			{
+				Log.e(LOG_TAG, "repairNestedLegacyLayout: " + e.toString());
+			}
+			deleteRecursively(nested);
+		}
+	}
+
+	/** Move every child of {@code from} into {@code toParent}; existing targets win. */
+	private static void moveTreeUp(File from, File toParent)
+	{
+		File[] children = from.listFiles();
+		if (children == null || children.length == 0)
+			return;
+		if (!toParent.isDirectory() && !toParent.mkdirs())
+			return;
+
+		for (File child : children)
+		{
+			File target = new File(toParent, child.getName());
+			if (child.isDirectory())
+			{
+				// Merge even when the target directory already exists.
+				moveTreeUp(child, target);
+			}
+			else if (!target.exists())
+			{
+				if (!child.renameTo(target))
+				{
+					// rename can fail across mount points - fall back to copy + delete
+					try
+					{
+						copyLocalFile(child, target);
+						child.delete();
+					}
+					catch (Exception e)
+					{
+						Log.e(LOG_TAG, "moveTreeUp: " + e.toString());
+					}
+				}
+			}
+			// target exists: keep the live copy; the duplicate goes away with the tree
+		}
+	}
+
+	private static void copyLocalFile(File src, File dst) throws Exception
+	{
+		FileInputStream in = new FileInputStream(src);
+		try
+		{
+			File parent = dst.getParentFile();
+			if (parent != null && !parent.exists() && !parent.mkdirs())
+				throw new IOException("Cannot create directory: " + parent.getAbsolutePath());
+			FileOutputStream out = new FileOutputStream(dst);
+			try
+			{
+				byte[] buffer = new byte[64 * 1024];
+				int read;
+				while ((read = in.read(buffer)) != -1)
+					out.write(buffer, 0, read);
+				out.flush();
+			}
+			finally
+			{
+				try { out.close(); } catch (Exception ignored) {}
+			}
+		}
+		finally
+		{
+			try { in.close(); } catch (Exception ignored) {}
+		}
+	}
+
+	private static void deleteRecursively(File dir)
+	{
+		if (dir == null)
+			return;
+		File[] children = dir.listFiles();
+		if (children != null)
+		{
+			for (File child : children)
+			{
+				if (child.isDirectory())
+					deleteRecursively(child);
+				else
+					child.delete();
+			}
+		}
+		dir.delete();
 	}
 
 	private static boolean isAssetDirectory(String path)
